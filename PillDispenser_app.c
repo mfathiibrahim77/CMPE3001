@@ -23,7 +23,7 @@
  *      CCR  58 = slot 2 (~60 deg)    CCR 125 = slot 4 (180 deg)
  *
  *  DESIGN:  3 inputs  = keypad, heart-rate sensor, confirm button
- *           4 outputs = LCD, servo carousel, GREEN LED, RED LED
+ *           4 outputs = LCD, servo carousel, on-board GREEN LED (LD2), base RED LED
  *
  *  Paste each block below into the matching USER CODE section of main.c.
  * ===================================================================== */
@@ -70,9 +70,13 @@
 #define CONFIRM_BTN_PORT  GPIOB
 #define CONFIRM_BTN_PIN   GPIO_PIN_3
 
-/* ---- Panel LED indices (T7-1 = PA1, T7-2 = PA4) ---------------------- */
-#define LED_GREEN         0u          /* OK / armed / dose confirmed        */
-#define LED_RED           1u          /* alert: bad vitals or missed dose   */
+/* ---- Panel LED indices --------------------------------------------------
+ * The base-board LEDs are all RED, so for a clear green/red contrast we use:
+ *   LED_OK    = index 3 = PA5 = the Nucleo's on-board GREEN LED (LD2).
+ *   LED_ALERT = index 0 = PA1 = a base-board RED LED (T7-1).
+ * These are two independent GPIO output lines, so they count as two outputs. */
+#define LED_OK            3u          /* GREEN on-board LD2: OK / confirmed  */
+#define LED_ALERT         0u          /* RED base-board LED: alert           */
 
 
 /* ============ USER CODE BEGIN 0 ============ */
@@ -214,16 +218,16 @@ static void wait_for_password(void)
                 HAL_Delay(250);
                 if (strncmp(entered, PASSWORD, PIN_LEN) == 0)
                 {
-                    Panel_SetLed(LED_GREEN, 1);
+                    Panel_SetLed(LED_OK, 1);
                     show2("PIN accepted", "");
                     HAL_Delay(900);
-                    Panel_SetLed(LED_GREEN, 0);
+                    Panel_SetLed(LED_OK, 0);
                     return;                         /* the only way out */
                 }
-                Panel_SetLed(LED_RED, 1);
+                Panel_SetLed(LED_ALERT, 1);
                 show2("Wrong PIN", "Try again");
                 HAL_Delay(1500);
-                Panel_SetLed(LED_RED, 0);
+                Panel_SetLed(LED_ALERT, 0);
                 n = 0;
                 show2("Enter PIN:", "____");
             }
@@ -248,7 +252,7 @@ static int32_t measure_vitals(int32_t *spo2_out)
 
     hist_reset(&hr_hist);
     *spo2_out = -1;
-    Panel_SetLed(LED_RED, 1);                       /* action needed       */
+    Panel_SetLed(LED_ALERT, 1);                       /* action needed       */
     show2("Dose due!", "Place finger...");
 
     while ((HAL_GetTick() - start) < VITALS_TIMEOUT_MS)
@@ -265,7 +269,7 @@ static int32_t measure_vitals(int32_t *spo2_out)
                 if (settled > 0)
                 {
                     *spo2_out = last_spo2;
-                    Panel_SetLed(LED_RED, 0);
+                    Panel_SetLed(LED_ALERT, 0);
                     return settled;                 /* trustworthy bpm     */
                 }
             }
@@ -294,8 +298,8 @@ static int32_t measure_vitals(int32_t *spo2_out)
 
     Keypad_Init();                               // supplied keypad driver
     Panel_Init();                                // supplied panel driver (LEDs/buttons)
-    Panel_SetLed(LED_GREEN, 0);
-    Panel_SetLed(LED_RED,   0);
+    Panel_SetLed(LED_OK, 0);
+    Panel_SetLed(LED_ALERT,   0);
 
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);    // servo (Lab 3)
     servo_set(SERVO_HOME);
@@ -352,25 +356,25 @@ static int32_t measure_vitals(int32_t *spo2_out)
 
         if (hr < 0)                               // no reading taken
         {
-            Panel_SetLed(LED_RED, 1);
+            Panel_SetLed(LED_ALERT, 1);
             show2("No vitals read", "Dispensing...");
             HAL_Delay(1500);
         }
         else if (hr < HR_MIN || hr > HR_MAX)      // abnormal -> alert, still dose
         {
-            Panel_SetLed(LED_RED, 1);
+            Panel_SetLed(LED_ALERT, 1);
             snprintf(l1, sizeof(l1), "HR %ld ABNORMAL", (long)hr);
             show2(l1, "Contact carer!");
             HAL_Delay(2500);
         }
         else                                      // vitals OK
         {
-            Panel_SetLed(LED_RED, 0);
-            Panel_SetLed(LED_GREEN, 1);
+            Panel_SetLed(LED_ALERT, 0);
+            Panel_SetLed(LED_OK, 1);
             snprintf(l1, sizeof(l1), "HR %ld SpO2 %ld%%", (long)hr, (long)spo2);
             show2(l1, "Vitals OK");
             HAL_Delay(2000);
-            Panel_SetLed(LED_GREEN, 0);
+            Panel_SetLed(LED_OK, 0);
         }
 
         {
@@ -391,11 +395,11 @@ static int32_t measure_vitals(int32_t *spo2_out)
         if (confirm_pressed())                    // input: confirm button
         {
             doses_taken++;
-            Panel_SetLed(LED_RED,   0);
-            Panel_SetLed(LED_GREEN, 1);           // GREEN = confirmed
+            Panel_SetLed(LED_ALERT,   0);
+            Panel_SetLed(LED_OK, 1);           // GREEN = confirmed
             show2("Dose confirmed", "Thank you");
             HAL_Delay(1500);
-            Panel_SetLed(LED_GREEN, 0);
+            Panel_SetLed(LED_OK, 0);
 
             slot      = (uint8_t)((slot + 1u) % NUM_SLOTS);  // advance carousel
             remaining = DOSE_INTERVAL_S;
@@ -408,13 +412,13 @@ static int32_t measure_vitals(int32_t *spo2_out)
             uint8_t f;
             for (f = 0; f < 6u; f++)
             {
-                Panel_SetLed(LED_RED, (uint8_t)(f & 1u));
+                Panel_SetLed(LED_ALERT, (uint8_t)(f & 1u));
                 show2("DOSE MISSED", "Call carer!");
                 HAL_Delay(300);
             }
-            Panel_SetLed(LED_RED, 1);             // leave RED on as a flag
+            Panel_SetLed(LED_ALERT, 1);             // leave RED on as a flag
             HAL_Delay(1500);
-            Panel_SetLed(LED_RED, 0);
+            Panel_SetLed(LED_ALERT, 0);
 
             slot      = (uint8_t)((slot + 1u) % NUM_SLOTS);  // move on anyway
             remaining = DOSE_INTERVAL_S;
