@@ -541,6 +541,15 @@ static int32_t measure_vitals(int32_t *spo2_out)
     login();                                                    // unlock with a PIN
 
     Oxi_Start(&hi2c3);                          // start heart-rate acquisition
+    {   /* HR sensor check at start-up (like the §9 reference app) */
+        uint8_t addr = Oxi_ScanBus(&hi2c3);
+        char l2[17];
+        if (addr == 0u)                { strcpy(l2, "NOT FOUND - T1?"); }
+        else if (addr == OXI_I2C_ADDR) { strcpy(l2, "found, OK"); }
+        else                           { snprintf(l2, sizeof(l2), "at 0x%02X ?", addr); }
+        show2("HR sensor:", l2);
+        HAL_Delay(2000);
+    }
     HAL_Delay(500);
     show2("Dispenser ready", "Next dose soon");
 
