@@ -409,7 +409,12 @@ static int32_t hist_stable(const Hist *h, int32_t spread_max)
 
 /* One vitals measurement. Returns a settled HR (bpm), or -1 on timeout or
  * '#' skip. *spo2_out gets the matching SpO2 (or -1). The LCD shows the live
- * sensor values while it measures, so you can see the sensor working. */
+ * sensor values while it measures, so you can see the sensor working.
+ *
+ * Leftover guard: the sensor module keeps its last result (it is not reset
+ * when the STM32 restarts). A leftover number is FROZEN - it never changes -
+ * while a real finger always makes HR/SpO2 move a little. So the number that
+ * is already there when we start is ignored until it changes or drops out. */
 static int32_t measure_vitals(int32_t *spo2_out)
 {
     uint32_t   start      = HAL_GetTick();
@@ -417,6 +422,9 @@ static int32_t measure_vitals(int32_t *spo2_out)
     uint32_t   last_valid = 0;       /* time of the last valid sample       */
     uint32_t   last_push  = 0;
     uint8_t    in_run     = 0;       /* finger on (allowing short gaps)     */
+    uint8_t    fresh      = 1;       /* 0 while only the leftover is seen   */
+    int32_t    base_hb    = -1;      /* leftover values at the start        */
+    int16_t    base_o2    = -1;
     OxiReading rd;
     Hist       hr_hist;
     int32_t    last_spo2  = -1;
@@ -424,13 +432,25 @@ static int32_t measure_vitals(int32_t *spo2_out)
     hist_reset(&hr_hist);
     *spo2_out = -1;
 
+    if (Oxi_Read(&rd) == HAL_OK && rd.heartbeat > 0)   /* something already there */
+    {
+        fresh   = 0u;
+        base_hb = rd.heartbeat;
+        base_o2 = rd.spo2;
+    }
+
     while ((HAL_GetTick() - start) < VITALS_TIMEOUT_MS)
     {
         uint32_t          now  = HAL_GetTick();
         HAL_StatusTypeDef st   = Oxi_Read(&rd);
-        uint8_t           ok   = (uint8_t)(st == HAL_OK && rd.heartbeat > 0);
+        uint8_t           raw  = (uint8_t)(st == HAL_OK && rd.heartbeat > 0);
+        uint8_t           ok;
         uint32_t          left = (VITALS_TIMEOUT_MS - (now - start) + 999u) / 1000u;
         char              l1[17], l2[17];
+
+        /* the leftover counts as gone once it changes or drops out */
+        if (!fresh && (!raw || rd.heartbeat != base_hb || rd.spo2 != base_o2)) { fresh = 1u; }
+        ok = (uint8_t)(raw && fresh);
 
         if (ok)
         {
@@ -481,7 +501,7 @@ static int32_t measure_vitals(int32_t *spo2_out)
         }
         else if (ok)
         {
-            snprintf(l2, sizeof(l2), "HR %ld", (long)rd.heartbeat);
+            snprintf(l2, sizeof(l2), "HR %ld SpO2 --", (long)rd.heartbeat);
         }
         else if (in_run)
         {
@@ -624,7 +644,8 @@ static int32_t measure_vitals(int32_t *spo2_out)
         {
             char l1[17];
             Panel_SetLed(LED_OK, 1);
-            snprintf(l1, sizeof(l1), "HR %ld SpO2 %ld%%", (long)hr, (long)spo2);
+            if (spo2 > 0) { snprintf(l1, sizeof(l1), "HR %ld SpO2 %ld%%", (long)hr, (long)spo2); }
+            else          { snprintf(l1, sizeof(l1), "HR %ld SpO2 --", (long)hr); }
             show2(l1, "Vitals OK");
             HAL_Delay(2000);
             Panel_SetLed(LED_OK, 0);
