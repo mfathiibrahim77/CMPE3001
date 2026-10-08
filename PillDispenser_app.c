@@ -1,29 +1,31 @@
 /* =====================================================================
  *  CMPE3001 Design Assignment
- *  Smart Medication Dispenser  —  application code for main.c
+ *  Smart Medication Dispenser  —  FINAL application code for main.c
  * ---------------------------------------------------------------------
- *  REUSED UNCHANGED FROM THE SUPPLIED SUPPORT MATERIALS:
- *      LCD1602_I2C.h/.c   16x2 LCD over I2C1 (hi2c1)          (§5)
- *      oximeter.h/.c      heart-rate / SpO2 sensor over I2C3  (§6)
- *      keypad.h/.c        3x4 matrix keypad (7 GPIOs)         (§7)
- *      panel.h/.c         4 push buttons + 4 LEDs             (§8)
- *  Copy those four driver pairs into Core/Inc and Core/Src exactly as given.
+ *  REUSED UNCHANGED FROM THE SUPPLIED SUPPORT MATERIALS (§5-§8):
+ *      LCD1602_I2C.h/.c   16x2 LCD over I2C1 (hi2c1)
+ *      oximeter.h/.c      heart-rate / SpO2 sensor over I2C3 (hi2c3)
+ *      keypad.h/.c        3x4 matrix keypad (7 GPIOs)
+ *      panel.h/.c         4 push buttons + 4 LEDs
+ *  The HR stability filter (Hist / hist_stable) is lifted from §9.
  *
- *  The heart-rate stability filter below (Hist / hist_push / hist_stable)
- *  is taken straight from the Support-Materials reference app (§9) — it
- *  rejects the PPG "doubling" artefact so a real 72 bpm never shows as 144.
+ *  ONLY CubeMX addition on top of §4 is the servo (Lab 3):
+ *      TIM2 internal clock, CH1 PWM, PSC 1599, ARR 999, Pulse 25, PA0.
  *
- *  ONLY CubeMX ADDITION on top of the §4 setup is the servo, as in Lab 3:
- *      TIM2 -> Internal Clock, Channel1 = PWM Generation CH1,
- *              Prescaler = 1599, Counter Period = 999, Pulse = 25.
- *      (PA0 / A0 is left free by the base board, so nothing else changes.)
+ *  DESIGN  (every part does real work - nothing bolted on):
+ *    INPUTS  (3): keypad (PIN), HR/SpO2 sensor (vitals gate), buttons.
+ *    OUTPUTS (4): LCD, servo 4-slot carousel, GREEN LD2 (OK), RED LED (alert).
  *
- *  Servo maths from Lab 3 (1 count = 20 us,  CCR = 25 + 0.556 * angle):
- *      CCR  25 = slot 1 (0 deg)      CCR  92 = slot 3 (~120 deg)
- *      CCR  58 = slot 2 (~60 deg)    CCR 125 = slot 4 (180 deg)
+ *  FEATURES:
+ *    - First-run PIN enrolment (set + confirm), then log in to use it.
+ *    - Change PIN on a button, old PIN required.  (PIN kept in RAM.)
+ *    - Vitals SAFETY GATE: normal -> dispense; HR low/high (or no reading)
+ *      -> hold the dose, a carer must press OVERRIDE to release it.
+ *    - 4-slot carousel (morning/noon/evening/night).
+ *    - Missed-dose alert if the "taken" button isn't pressed in time.
  *
- *  DESIGN:  3 inputs  = keypad, heart-rate sensor, confirm button
- *           4 outputs = LCD, servo carousel, on-board GREEN LED (LD2), base RED LED
+ *  BUTTONS:  BUTTON0 PB3 = confirm "taken"   BUTTON1 PB6 = change PIN
+ *            BUTTON2 PA7 = carer override     BUTTON3 PA6 = spare
  *
  *  Paste each block below into the matching USER CODE section of main.c.
  * ===================================================================== */
@@ -40,49 +42,51 @@
 
 /* ============ USER CODE BEGIN PD ============ */
 /* ---- Servo carousel: one CCR value per compartment (from Lab 3) ---- */
-#define SERVO_SLOT1       25u         /* 0   deg  - morning dose            */
-#define SERVO_SLOT2       58u         /* ~60 deg  - noon dose               */
-#define SERVO_SLOT3       92u         /* ~120deg  - evening dose            */
-#define SERVO_SLOT4       125u        /* 180 deg  - night dose              */
-#define SERVO_HOME        SERVO_SLOT1 /* resting position between doses     */
+#define SERVO_SLOT1       25u
+#define SERVO_SLOT2       58u
+#define SERVO_SLOT3       92u
+#define SERVO_SLOT4       125u
+#define SERVO_HOME        SERVO_SLOT1
 #define NUM_SLOTS         4u
 
-/* ---- Timing (seconds). Short values so the demo runs quickly. -------- */
-#define DOSE_INTERVAL_S   15u         /* gap between scheduled doses        */
-#define CONFIRM_WINDOW_S  15u         /* time allowed to press "taken"      */
+/* ---- Timing (seconds). Short values so the demo runs quickly. ---- */
+#define DOSE_INTERVAL_S   15u
+#define CONFIRM_WINDOW_S  15u
+#define OVERRIDE_WINDOW_S 20u
 
-/* ---- Heart-rate safe band (bpm) -------------------------------------- */
+/* ---- Heart-rate safe band (bpm) ---- */
 #define HR_MIN            50
 #define HR_MAX            120
 
-/* ---- Vitals stability filter (same values as the §9 reference app) --- */
-#define POLL_MS           250u        /* how often we re-read the sensor    */
-#define HIST_N            5           /* readings that must agree           */
-#define HR_SPREAD_MAX     12          /* max spread across them (bpm)       */
-#define VITALS_TIMEOUT_MS 20000u      /* give up waiting for a finger (ms)  */
+/* ---- Vitals stability filter (same values as the §9 reference app) ---- */
+#define POLL_MS           250u
+#define HIST_N            5
+#define HR_SPREAD_MAX     12
+#define VITALS_TIMEOUT_MS 20000u
 
-/* ---- Power-on PIN (same as the §9 reference app) --------------------- */
-#define PASSWORD          "1234"
+/* ---- PIN ---- */
 #define PIN_LEN           4
 #define PIN_SCAN_MS       8u
 
-/* ---- Confirm button = BUTTON0 = PB3 (active low, 10k pull-up on board)  */
-#define CONFIRM_BTN_PORT  GPIOB
-#define CONFIRM_BTN_PIN   GPIO_PIN_3
+/* ---- Panel LED indices (base LEDs all RED; LD2 is the on-board GREEN) ---- */
+#define LED_OK            3u          /* PA5 -> on-board GREEN LD2: OK/confirmed */
+#define LED_ALERT         0u          /* PA1 -> base-board RED LED: alert        */
 
-/* ---- Panel LED indices --------------------------------------------------
- * The base-board LEDs are all RED, so for a clear green/red contrast we use:
- *   LED_OK    = index 3 = PA5 = the Nucleo's on-board GREEN LED (LD2).
- *   LED_ALERT = index 0 = PA1 = a base-board RED LED (T7-1).
- * These are two independent GPIO output lines, so they count as two outputs. */
-#define LED_OK            3u          /* GREEN on-board LD2: OK / confirmed  */
-#define LED_ALERT         0u          /* RED base-board LED: alert           */
+/* ---- Buttons (active low; board has 10k pull-ups) ---- */
+#define CONFIRM_PORT      GPIOB
+#define CONFIRM_PIN       GPIO_PIN_3  /* BUTTON0: dose taken        */
+#define CHANGE_PORT       GPIOB
+#define CHANGE_PIN        GPIO_PIN_6  /* BUTTON1: change PIN         */
+#define OVERRIDE_PORT     GPIOA
+#define OVERRIDE_PIN      GPIO_PIN_7  /* BUTTON2: carer override     */
 
 
 /* ============ USER CODE BEGIN 0 ============ */
-/* ------------------------------ helpers ------------------------------ */
+/* ---- the live PIN, held in RAM (set fresh at every power-up) ---- */
+static char current_pin[PIN_LEN + 1] = "";
 
-/* Pad a string to 16 chars so a shorter line leaves no stray characters. */
+/* -------- small helpers -------- */
+
 static void pad16(char *s)
 {
     size_t n = strlen(s);
@@ -90,7 +94,6 @@ static void pad16(char *s)
     s[16] = '\0';
 }
 
-/* Write two full 16-character lines to the LCD (uses the supplied driver). */
 static void show2(const char *l1, const char *l2)
 {
     char a[17], b[17];
@@ -100,62 +103,18 @@ static void show2(const char *l1, const char *l2)
     lcd_put_cur(1, 0); lcd_send_string(b);
 }
 
-/* ===== Heart-rate stability filter (from the §9 reference app) =====
- * A single reading cannot be trusted: just after a finger is placed, the
- * module's algorithm can count the dicrotic notch of the pulse as a second
- * beat and report exactly twice the true rate. A range check can't catch
- * that (140 is physiological). What catches it is agreement between
- * consecutive readings - the artefact comes and goes, while a real heart
- * rate settles into a narrow band. */
-typedef struct {
-    int32_t buf[HIST_N];
-    uint8_t cnt;                        /* how many samples are filled in  */
-    uint8_t idx;                        /* ring-buffer write index         */
-} Hist;
-
-static void hist_reset(Hist *h)
+/* A button reads LOW when pressed. */
+static uint8_t btn_down(GPIO_TypeDef *port, uint16_t pin)
 {
-    h->cnt = 0;
-    h->idx = 0;
+    return (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_RESET) ? 1u : 0u;
 }
 
-static void hist_push(Hist *h, int32_t v)
-{
-    h->buf[h->idx] = v;
-    h->idx = (uint8_t)((h->idx + 1u) % HIST_N);
-    if (h->cnt < HIST_N) { h->cnt++; }
-}
-
-/* Full history AND spread within the limit -> return the median,
- * otherwise -1 meaning "not settled yet". */
-static int32_t hist_stable(const Hist *h, int32_t spread_max)
-{
-    int32_t t[HIST_N];
-    uint8_t i, j;
-
-    if (h->cnt < HIST_N) { return -1; }
-
-    for (i = 0; i < HIST_N; i++) { t[i] = h->buf[i]; }
-
-    for (i = 1; i < HIST_N; i++) {              /* insertion sort, N = 5 */
-        int32_t k = t[i];
-        j = i;
-        while (j > 0u && t[j - 1] > k) { t[j] = t[j - 1]; j--; }
-        t[j] = k;
-    }
-
-    if ((t[HIST_N - 1] - t[0]) > spread_max) { return -1; }
-
-    return t[HIST_N / 2];                         /* median */
-}
-
-/* Command the servo to a CCR value (same call as Lab 3). */
+/* ---- servo ---- */
 static void servo_set(uint16_t ccr)
 {
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, ccr);
 }
 
-/* Return the CCR for a slot number 0..3. */
 static uint16_t slot_ccr(uint8_t slot)
 {
     switch (slot)
@@ -167,80 +126,160 @@ static uint16_t slot_ccr(uint8_t slot)
     }
 }
 
-/* Dispense: rotate the carousel so the due compartment lines up with the
- * drop hole, pause for the pill to fall, then return to the home position. */
 static void dispense_from_slot(uint8_t slot)
 {
     servo_set(slot_ccr(slot));
-    HAL_Delay(1500);                 /* compartment aligned - pill drops   */
+    HAL_Delay(1500);                 /* compartment aligned - pill drops */
     servo_set(SERVO_HOME);
-    HAL_Delay(400);                  /* re-seal                            */
+    HAL_Delay(400);                  /* re-seal */
 }
 
-/* Confirm button: 1 while held (active low). */
-static uint8_t confirm_pressed(void)
-{
-    return (HAL_GPIO_ReadPin(CONFIRM_BTN_PORT, CONFIRM_BTN_PIN) == GPIO_PIN_RESET)
-           ? 1u : 0u;
-}
+/* ===== PIN entry / management (keypad) ===== */
 
-/* -------- power-on PIN gate (keypad) --------
- * Blocking by design: nothing proceeds until the correct PIN is entered.
- * Same logic as the §9 reference app's wait_for_password(). */
-static void wait_for_password(void)
+/* Collect exactly PIN_LEN digits into out[PIN_LEN+1]. '*' = backspace,
+ * '#' = clear. Blocks until PIN_LEN digits are in. Echoes '*' per digit. */
+static void enter_pin(const char *prompt, char *out)
 {
-    char    entered[PIN_LEN + 1];
-    char    masked[PIN_LEN + 1];
     uint8_t n = 0;
+    char    masked[PIN_LEN + 1];
 
-    show2("Enter PIN:", "____");
+    show2(prompt, "____");
 
     for (;;)
     {
-        char k = Keypad_Scan();                 /* supplied keypad driver  */
+        char k = Keypad_Scan();
 
         if (k != 0)
         {
-            if      (k >= '0' && k <= '9') { if (n < PIN_LEN) { entered[n++] = k; } }
-            else if (k == '*')             { if (n > 0) { n--; } }   /* backspace */
-            else if (k == '#')             { n = 0; }                /* clear     */
+            if      (k >= '0' && k <= '9') { if (n < PIN_LEN) { out[n++] = k; } }
+            else if (k == '*')             { if (n > 0) { n--; } }
+            else if (k == '#')             { n = 0; }
 
-            {   /* echo entered digits as '*', the rest as '_' */
+            {
                 uint8_t i;
                 for (i = 0; i < PIN_LEN; i++) { masked[i] = (i < n) ? '*' : '_'; }
                 masked[PIN_LEN] = '\0';
                 lcd_put_cur(1, 0); lcd_send_string(masked);
             }
 
-            if (n == PIN_LEN)                       /* verify automatically */
+            if (n == PIN_LEN)
             {
-                entered[n] = '\0';
-                HAL_Delay(250);
-                if (strncmp(entered, PASSWORD, PIN_LEN) == 0)
-                {
-                    Panel_SetLed(LED_OK, 1);
-                    show2("PIN accepted", "");
-                    HAL_Delay(900);
-                    Panel_SetLed(LED_OK, 0);
-                    return;                         /* the only way out */
-                }
-                Panel_SetLed(LED_ALERT, 1);
-                show2("Wrong PIN", "Try again");
-                HAL_Delay(1500);
-                Panel_SetLed(LED_ALERT, 0);
-                n = 0;
-                show2("Enter PIN:", "____");
+                out[PIN_LEN] = '\0';
+                HAL_Delay(250);          /* let the last '*' be seen */
+                return;
             }
         }
         HAL_Delay(PIN_SCAN_MS);
     }
 }
 
-/* -------- one vitals reading, stability-filtered --------
- * Waits for a finger and returns a SETTLED heart rate (the median of
- * HIST_N agreeing readings), or -1 on timeout / skip. *spo2_out receives
- * the matching SpO2 (or -1). Uses the §9 filter so the PPG doubling
- * artefact can't put a wrong value on the display. */
+/* Set a new PIN into dest, requiring the two entries to match. */
+static void set_new_pin(char *dest)
+{
+    char a[PIN_LEN + 1], b[PIN_LEN + 1];
+
+    for (;;)
+    {
+        enter_pin("Set new PIN:", a);
+        enter_pin("Confirm PIN:", b);
+
+        if (strncmp(a, b, PIN_LEN) == 0)
+        {
+            strncpy(dest, a, PIN_LEN + 1);
+            Panel_SetLed(LED_OK, 1);
+            show2("PIN set", "");
+            HAL_Delay(900);
+            Panel_SetLed(LED_OK, 0);
+            return;
+        }
+
+        Panel_SetLed(LED_ALERT, 1);
+        show2("PIN mismatch", "Try again");
+        HAL_Delay(1500);
+        Panel_SetLed(LED_ALERT, 0);
+    }
+}
+
+/* Ask for the PIN and compare it to current_pin: 1 = match. */
+static uint8_t verify_pin(const char *prompt)
+{
+    char e[PIN_LEN + 1];
+    enter_pin(prompt, e);
+    return (strncmp(e, current_pin, PIN_LEN) == 0) ? 1u : 0u;
+}
+
+/* Log in: keep asking until the PIN is right. */
+static void unlock(void)
+{
+    for (;;)
+    {
+        if (verify_pin("Enter PIN:"))
+        {
+            Panel_SetLed(LED_OK, 1);
+            show2("Unlocked", "");
+            HAL_Delay(900);
+            Panel_SetLed(LED_OK, 0);
+            return;
+        }
+        Panel_SetLed(LED_ALERT, 1);
+        show2("Wrong PIN", "Try again");
+        HAL_Delay(1500);
+        Panel_SetLed(LED_ALERT, 0);
+    }
+}
+
+/* Change the PIN - old PIN must be entered first. */
+static void change_pin(void)
+{
+    if (verify_pin("Old PIN:"))
+    {
+        set_new_pin(current_pin);
+    }
+    else
+    {
+        Panel_SetLed(LED_ALERT, 1);
+        show2("Wrong PIN", "Not changed");
+        HAL_Delay(1800);
+        Panel_SetLed(LED_ALERT, 0);
+    }
+}
+
+/* ===== Heart-rate stability filter (from the §9 reference app) =====
+ * Rejects the PPG doubling artefact: a reading is only trusted once
+ * HIST_N consecutive values agree within HR_SPREAD_MAX bpm. */
+typedef struct {
+    int32_t buf[HIST_N];
+    uint8_t cnt;
+    uint8_t idx;
+} Hist;
+
+static void hist_reset(Hist *h) { h->cnt = 0; h->idx = 0; }
+
+static void hist_push(Hist *h, int32_t v)
+{
+    h->buf[h->idx] = v;
+    h->idx = (uint8_t)((h->idx + 1u) % HIST_N);
+    if (h->cnt < HIST_N) { h->cnt++; }
+}
+
+static int32_t hist_stable(const Hist *h, int32_t spread_max)
+{
+    int32_t t[HIST_N];
+    uint8_t i, j;
+
+    if (h->cnt < HIST_N) { return -1; }
+    for (i = 0; i < HIST_N; i++) { t[i] = h->buf[i]; }
+    for (i = 1; i < HIST_N; i++) {
+        int32_t k = t[i]; j = i;
+        while (j > 0u && t[j - 1] > k) { t[j] = t[j - 1]; j--; }
+        t[j] = k;
+    }
+    if ((t[HIST_N - 1] - t[0]) > spread_max) { return -1; }
+    return t[HIST_N / 2];
+}
+
+/* One stability-filtered vitals reading. Returns a settled HR (bpm), or
+ * -1 on timeout / skip. *spo2_out gets the matching SpO2 (or -1). */
 static int32_t measure_vitals(int32_t *spo2_out)
 {
     uint32_t   start = HAL_GetTick();
@@ -252,25 +291,25 @@ static int32_t measure_vitals(int32_t *spo2_out)
 
     hist_reset(&hr_hist);
     *spo2_out = -1;
-    Panel_SetLed(LED_ALERT, 1);                       /* action needed       */
+    Panel_SetLed(LED_ALERT, 1);
     show2("Dose due!", "Place finger...");
 
     while ((HAL_GetTick() - start) < VITALS_TIMEOUT_MS)
     {
         char l2[17];
 
-        if (Oxi_Read(&rd) == HAL_OK && rd.heartbeat > 0)   /* supplied driver */
+        if (Oxi_Read(&rd) == HAL_OK && rd.heartbeat > 0)
         {
             hist_push(&hr_hist, rd.heartbeat);
             if (rd.spo2 > 0) { last_spo2 = rd.spo2; }
 
-            {   /* settled once HIST_N readings agree within HR_SPREAD_MAX */
+            {
                 int32_t settled = hist_stable(&hr_hist, HR_SPREAD_MAX);
                 if (settled > 0)
                 {
                     *spo2_out = last_spo2;
                     Panel_SetLed(LED_ALERT, 0);
-                    return settled;                 /* trustworthy bpm     */
+                    return settled;
                 }
             }
             snprintf(l2, sizeof(l2), "Reading%s", dots[spin & 3u]);
@@ -283,30 +322,55 @@ static int32_t measure_vitals(int32_t *spo2_out)
         show2("Dose due!", l2);
         spin++;
 
-        if (Keypad_Scan() == '#') { return -1; }    /* '#' skips (demo)    */
+        if (Keypad_Scan() == '#') { return -1; }    /* '#' skips (demo) */
         HAL_Delay(POLL_MS);
     }
-    return -1;                                       /* timed out          */
+    return -1;
+}
+
+/* Carer safety gate: flash red and wait for the OVERRIDE button.
+ * Returns 1 if a carer authorised, 0 on timeout (dose withheld). */
+static uint8_t wait_for_override(void)
+{
+    uint32_t start = HAL_GetTick();
+    uint8_t  spin  = 0;
+
+    while ((HAL_GetTick() - start) < (OVERRIDE_WINDOW_S * 1000u))
+    {
+        Panel_SetLed(LED_ALERT, (uint8_t)(spin & 1u));   /* flash */
+        show2("Carer authorise?", "Press OVERRIDE");
+
+        if (btn_down(OVERRIDE_PORT, OVERRIDE_PIN))
+        {
+            Panel_SetLed(LED_ALERT, 0);
+            return 1u;
+        }
+        spin++;
+        HAL_Delay(300);
+    }
+    Panel_SetLed(LED_ALERT, 0);
+    return 0u;                                           /* withhold */
 }
 
 
 /* ============ USER CODE BEGIN 2 ============ (runs once, after the MX_*_Init calls) */
 /*
-    lcd_init(&hi2c1);                            // supplied LCD driver
-    show2("Pill Dispenser", "Starting...");
+    lcd_init(&hi2c1);
+    show2("Med Dispenser", "Starting...");
     HAL_Delay(800);
 
-    Keypad_Init();                               // supplied keypad driver
-    Panel_Init();                                // supplied panel driver (LEDs/buttons)
+    Keypad_Init();
+    Panel_Init();
     Panel_SetLed(LED_OK, 0);
-    Panel_SetLed(LED_ALERT,   0);
+    Panel_SetLed(LED_ALERT, 0);
 
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);    // servo (Lab 3)
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);   // servo
     servo_set(SERVO_HOME);
 
-    wait_for_password();                         // keypad PIN gate (blocks here)
+    set_new_pin(current_pin);                   // first-run PIN enrolment (set + confirm)
+    unlock();                                   // log in with that PIN
 
-    Oxi_Start(&hi2c3);                           // supplied oximeter driver
+    Oxi_Start(&hi2c3);                          // start heart-rate acquisition
     HAL_Delay(500);
     show2("Dispenser ready", "Next dose: 15s");
 */
@@ -316,12 +380,13 @@ static int32_t measure_vitals(int32_t *spo2_out)
 /*
     typedef enum { ST_WAIT, ST_MEASURE, ST_DISPENSE, ST_CONFIRM } DispState;
     DispState  state       = ST_WAIT;
-    uint32_t   last_tick   = HAL_GetTick();      // 1-second counter
-    uint32_t   remaining   = DOSE_INTERVAL_S;    // seconds to next dose
-    uint8_t    slot        = 0;                  // which compartment (0..3)
+    uint32_t   last_tick   = HAL_GetTick();
+    uint32_t   remaining   = DOSE_INTERVAL_S;
+    uint8_t    slot        = 0;
     uint32_t   doses_taken = 0;
     int32_t    hr = -1, spo2 = -1;
-    uint32_t   confirm_start = 0;                // for the missed-dose timeout
+    uint8_t    authorised = 0;
+    uint32_t   confirm_start = 0;
 */
 
 
@@ -329,8 +394,16 @@ static int32_t measure_vitals(int32_t *spo2_out)
 /*
     switch (state)
     {
-    // ---- 1. count down to the next scheduled dose ----
+    // ---- 1. idle: count down, and allow a PIN change ----
     case ST_WAIT:
+        if (btn_down(CHANGE_PORT, CHANGE_PIN))      // BUTTON1 -> change PIN
+        {
+            change_pin();
+            while (btn_down(CHANGE_PORT, CHANGE_PIN)) { HAL_Delay(10); }  // wait release
+            last_tick = HAL_GetTick();
+            show2("Dispenser ready", "Next dose: 15s");
+            break;
+        }
         if ((HAL_GetTick() - last_tick) >= 1000u)
         {
             char l2[17];
@@ -338,36 +411,42 @@ static int32_t measure_vitals(int32_t *spo2_out)
             if (remaining > 0u) { remaining--; }
             snprintf(l2, sizeof(l2), "Slot %u in %lus",
                      (unsigned)(slot + 1u), (unsigned long)remaining);
-            show2("Dispenser ready", l2);        // refreshed once per second
+            show2("Dispenser ready", l2);
             if (remaining == 0u) { state = ST_MEASURE; }
         }
         break;
 
-    // ---- 2. read the patient's vitals (input: HR sensor) ----
+    // ---- 2. read vitals ----
     case ST_MEASURE:
         hr = measure_vitals(&spo2);
         state = ST_DISPENSE;
         break;
 
-    // ---- 3. decide, then rotate the carousel to the due slot ----
+    // ---- 3. vitals SAFETY GATE, then dispense ----
     case ST_DISPENSE:
     {
         char l1[17];
+        uint8_t safe = (uint8_t)(hr >= HR_MIN && hr <= HR_MAX);
 
-        if (hr < 0)                               // no reading taken
+        authorised = 1;                             // assume OK until proven otherwise
+
+        if (hr < 0)                                 // no reading taken
         {
             Panel_SetLed(LED_ALERT, 1);
-            show2("No vitals read", "Dispensing...");
+            show2("No vitals read", "Carer needed");
             HAL_Delay(1500);
+            authorised = wait_for_override();
         }
-        else if (hr < HR_MIN || hr > HR_MAX)      // abnormal -> alert, still dose
+        else if (!safe)                             // HR low or high -> hold
         {
             Panel_SetLed(LED_ALERT, 1);
-            snprintf(l1, sizeof(l1), "HR %ld ABNORMAL", (long)hr);
-            show2(l1, "Contact carer!");
-            HAL_Delay(2500);
+            if (hr < HR_MIN) { snprintf(l1, sizeof(l1), "HR %ld LOW", (long)hr); }
+            else             { snprintf(l1, sizeof(l1), "HR %ld HIGH", (long)hr); }
+            show2(l1, "Dose HELD");
+            HAL_Delay(2000);
+            authorised = wait_for_override();       // carer must release it
         }
-        else                                      // vitals OK
+        else                                        // vitals OK -> go
         {
             Panel_SetLed(LED_ALERT, 0);
             Panel_SetLed(LED_OK, 1);
@@ -377,38 +456,50 @@ static int32_t measure_vitals(int32_t *spo2_out)
             Panel_SetLed(LED_OK, 0);
         }
 
+        if (!authorised)                            // withheld -> skip this dose
+        {
+            Panel_SetLed(LED_ALERT, 1);
+            show2("Dose WITHHELD", "No authorise");
+            HAL_Delay(2000);
+            Panel_SetLed(LED_ALERT, 0);
+            slot      = (uint8_t)((slot + 1u) % NUM_SLOTS);
+            remaining = DOSE_INTERVAL_S;
+            last_tick = HAL_GetTick();
+            state     = ST_WAIT;
+            break;
+        }
+
         {
             char l1b[17];
             snprintf(l1b, sizeof(l1b), "Dispensing S%u", (unsigned)(slot + 1u));
             show2(l1b, "Please take it");
         }
-        dispense_from_slot(slot);                 // servo carousel -> due slot
+        dispense_from_slot(slot);
 
         show2("Press button", "to confirm dose");
-        confirm_start = HAL_GetTick();            // start the missed-dose timer
+        confirm_start = HAL_GetTick();
         state = ST_CONFIRM;
         break;
     }
 
-    // ---- 4. wait for the "taken" press, with a missed-dose timeout ----
+    // ---- 4. wait for "taken", with a missed-dose timeout ----
     case ST_CONFIRM:
-        if (confirm_pressed())                    // input: confirm button
+        if (btn_down(CONFIRM_PORT, CONFIRM_PIN))    // BUTTON0 -> taken
         {
             doses_taken++;
-            Panel_SetLed(LED_ALERT,   0);
-            Panel_SetLed(LED_OK, 1);           // GREEN = confirmed
+            Panel_SetLed(LED_ALERT, 0);
+            Panel_SetLed(LED_OK, 1);
             show2("Dose confirmed", "Thank you");
             HAL_Delay(1500);
             Panel_SetLed(LED_OK, 0);
 
-            slot      = (uint8_t)((slot + 1u) % NUM_SLOTS);  // advance carousel
+            slot      = (uint8_t)((slot + 1u) % NUM_SLOTS);
             remaining = DOSE_INTERVAL_S;
             last_tick = HAL_GetTick();
             state     = ST_WAIT;
         }
         else if ((HAL_GetTick() - confirm_start) >= (CONFIRM_WINDOW_S * 1000u))
         {
-            // MISSED DOSE: flash the RED LED and warn on the LCD
             uint8_t f;
             for (f = 0; f < 6u; f++)
             {
@@ -416,11 +507,9 @@ static int32_t measure_vitals(int32_t *spo2_out)
                 show2("DOSE MISSED", "Call carer!");
                 HAL_Delay(300);
             }
-            Panel_SetLed(LED_ALERT, 1);             // leave RED on as a flag
-            HAL_Delay(1500);
             Panel_SetLed(LED_ALERT, 0);
 
-            slot      = (uint8_t)((slot + 1u) % NUM_SLOTS);  // move on anyway
+            slot      = (uint8_t)((slot + 1u) % NUM_SLOTS);
             remaining = DOSE_INTERVAL_S;
             last_tick = HAL_GetTick();
             state     = ST_WAIT;
