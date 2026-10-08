@@ -43,6 +43,7 @@
 /* ---- Timing (seconds). Short values so the demo runs quickly. ---- */
 #define DOSE_INTERVAL_S   5u          /* gap between doses                  */
 #define CONFIRM_WINDOW_S  10u         /* time to press "taken" (B0)         */
+#define HELD_TIMEOUT_S    30u         /* carer has this long, then withheld */
 
 /* ---- Heart-rate safe band (bpm) ---- */
 #define HR_MIN            50
@@ -539,6 +540,8 @@ static int32_t measure_vitals(int32_t *spo2_out)
     int32_t    hr = -1, spo2 = -1;
     uint32_t   confirm_start = 0;
     char       held_msg[17] = "";
+    uint32_t   held_start = 0;
+    uint32_t   held_shown = 0xFFFFFFFFu;
 
 
 // ==================================================================
@@ -611,12 +614,36 @@ static int32_t measure_vitals(int32_t *spo2_out)
 
         Panel_SetLed(LED_ALERT, 1);
         show2(held_msg, "Call carer (B2)");
+        held_start = HAL_GetTick();                   // start the carer window
+        held_shown = 0xFFFFFFFFu;
         state = ST_HELD;                              // dose is HELD
         break;
 
-    // ---- 4. dose held until a carer overrides (B2 + PIN) ----
+    // ---- 4. dose held: carer has HELD_TIMEOUT_S to override (B2 + PIN) ----
     case ST_HELD:
+    {
+        uint32_t gone = (HAL_GetTick() - held_start) / 1000u;
+
         Panel_SetLed(LED_ALERT, 1);
+
+        if (gone >= HELD_TIMEOUT_S)                   // nobody came -> withhold
+        {
+            show2("Dose withheld", "Carer alerted");
+            HAL_Delay(2000);
+            Panel_SetLed(LED_ALERT, 0);
+            state = ST_NEXT;
+            break;
+        }
+
+        if (gone != held_shown)                       // countdown, once a second
+        {
+            char l1[17];
+            snprintf(l1, sizeof(l1), "%-12.12s%2us", held_msg,
+                     (unsigned)((HELD_TIMEOUT_S - gone) % 100u));
+            show2(l1, "Call carer (B2)");
+            held_shown = gone;
+        }
+
         if (btn_down(OVERRIDE_PORT, OVERRIDE_PIN))
         {
             int8_t d;
@@ -625,9 +652,10 @@ static int32_t measure_vitals(int32_t *spo2_out)
             Panel_SetLed(LED_ALERT, 0);
             if      (d == 1) { state = ST_GIVE; }
             else if (d == 0) { show2("Dose skipped", "by carer"); HAL_Delay(1500); state = ST_NEXT; }
-            else             { show2(held_msg, "Call carer (B2)"); }   // wrong PIN: still held
+            else             { held_shown = 0xFFFFFFFFu; }   // wrong PIN: still held
         }
         break;
+    }
 
     // ---- 5. dispense from the due compartment ----
     case ST_GIVE:
