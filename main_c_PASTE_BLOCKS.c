@@ -50,20 +50,19 @@
 #define HR_MAX            120
 
 /* ---- Vitals ----
- * The sensor needs ~4-8 s to work out a pulse, then gives a new result about
- * every 4 s and HOLDS the last one in between - even for a few seconds after
- * the finger is lifted. We sample once a second and accept a reading once it
- * is steady AND has stayed valid long enough:
- *   QUICK_HOLD_MS   - normal reading that appeared after we started
- *   CONFIRM_HOLD_MS - a number was already showing when we started (could be
- *                     a leftover), or the value is abnormal (could be the
- *                     pulse "doubling" glitch): wait past one sensor update. */
+ * The sensor needs 4-8 s to work out a pulse (Support Materials §10), then
+ * gives a new result about every 4 s. Even with a finger on, it sometimes
+ * reports "nothing this time" for a moment, so short gaps are tolerated
+ * (like LOST_GRACE in the §9 reference app). A reading is accepted when it
+ * has lasted past one sensor update (CONFIRM_MS) and the last few seconds
+ * agree - this rejects leftover numbers and one-off glitches. Abnormal
+ * values must last one more update before they raise an alarm. */
 #define POLL_MS           250u
-#define SAMPLE_MS         1000u       /* read the sensor once a second      */
-#define HIST_N            2           /* samples that must agree            */
-#define HR_SPREAD_MAX     12          /* max spread across them (bpm)       */
-#define QUICK_HOLD_MS     1000u
-#define CONFIRM_HOLD_MS   6000u
+#define GRACE_MS          3000u       /* gap longer than this = finger off  */
+#define CONFIRM_MS        4500u       /* normal reading must last this long */
+#define CONFIRM_ABN_MS    8500u       /* abnormal reading must last longer  */
+#define HIST_N            3           /* last 3 one-second samples ...      */
+#define HR_SPREAD_MAX     12          /* ... must agree within 12 bpm       */
 #define VITALS_TIMEOUT_MS 20000u      /* give up after 20 s -> "No vitals"  */
 
 /* ---- PIN ---- */
@@ -409,74 +408,90 @@ static int32_t hist_stable(const Hist *h, int32_t spread_max)
 }
 
 /* One vitals measurement. Returns a settled HR (bpm), or -1 on timeout or
- * '#' skip. *spo2_out gets the matching SpO2 (or -1). See the Vitals notes
- * in the defines for why the hold times differ. */
+ * '#' skip. *spo2_out gets the matching SpO2 (or -1). The LCD shows the live
+ * sensor values while it measures, so you can see the sensor working. */
 static int32_t measure_vitals(int32_t *spo2_out)
 {
-    uint32_t   start       = HAL_GetTick();
-    uint32_t   last_sample = 0;
-    uint32_t   valid_since = 0;
-    uint8_t    valid       = 0;      /* sensor currently giving a reading   */
-    uint8_t    leftover    = 0;      /* a number was showing when we began  */
-    uint8_t    first       = 1;
-    uint8_t    spin        = 0;
+    uint32_t   start      = HAL_GetTick();
+    uint32_t   run_start  = 0;       /* when the current reading run began  */
+    uint32_t   last_valid = 0;       /* time of the last valid sample       */
+    uint32_t   last_push  = 0;
+    uint8_t    in_run     = 0;       /* finger on (allowing short gaps)     */
     OxiReading rd;
     Hist       hr_hist;
-    int32_t    last_spo2   = -1;
-    static const char *dots[4] = { "   ", ".  ", ".. ", "..." };
+    int32_t    last_spo2  = -1;
 
     hist_reset(&hr_hist);
     *spo2_out = -1;
 
-    if (Oxi_Read(&rd) == HAL_OK && rd.heartbeat > 0) { leftover = 1u; }
-
-    show2("Dose due!", "Place finger...");
-
     while ((HAL_GetTick() - start) < VITALS_TIMEOUT_MS)
     {
-        uint32_t now = HAL_GetTick();
-        char     l2[17];
+        uint32_t          now  = HAL_GetTick();
+        HAL_StatusTypeDef st   = Oxi_Read(&rd);
+        uint8_t           ok   = (uint8_t)(st == HAL_OK && rd.heartbeat > 0);
+        uint32_t          left = (VITALS_TIMEOUT_MS - (now - start) + 999u) / 1000u;
+        char              l1[17], l2[17];
 
-        if (first || (now - last_sample) >= SAMPLE_MS)      /* once a second */
+        if (ok)
         {
-            first       = 0u;
-            last_sample = now;
-            if (Oxi_Read(&rd) == HAL_OK && rd.heartbeat > 0)
+            if (!in_run)                               /* finger just arrived */
             {
-                if (!valid) { valid = 1u; valid_since = now; }
-                hist_push(&hr_hist, rd.heartbeat);
-                if (rd.spo2 > 0) { last_spo2 = rd.spo2; }
-            }
-            else                                 /* no finger / no result yet */
-            {
-                valid    = 0u;
-                leftover = 0u;                   /* anything after this is new */
+                in_run    = 1u;
+                run_start = now;
+                last_push = now - 1000u;               /* sample straight away */
                 hist_reset(&hr_hist);
             }
-        }
-
-        if (valid)
-        {
-            int32_t settled = hist_stable(&hr_hist, HR_SPREAD_MAX);
-            if (settled > 0)
+            last_valid = now;
+            if (rd.spo2 > 0) { last_spo2 = rd.spo2; }
+            if ((now - last_push) >= 1000u)            /* one sample a second */
             {
-                uint8_t  normal = (uint8_t)(settled >= HR_MIN && settled <= HR_MAX);
-                uint32_t need   = (leftover || !normal) ? CONFIRM_HOLD_MS : QUICK_HOLD_MS;
-                if ((now - valid_since) >= need)
+                hist_push(&hr_hist, rd.heartbeat);
+                last_push = now;
+            }
+
+            {
+                int32_t settled = hist_stable(&hr_hist, HR_SPREAD_MAX);
+                if (settled > 0)
                 {
-                    *spo2_out = last_spo2;
-                    return settled;
+                    uint8_t  normal = (uint8_t)(settled >= HR_MIN && settled <= HR_MAX);
+                    uint32_t need   = normal ? CONFIRM_MS : CONFIRM_ABN_MS;
+                    if ((now - run_start) >= need)
+                    {
+                        *spo2_out = last_spo2;
+                        return settled;
+                    }
                 }
             }
-            snprintf(l2, sizeof(l2), "Hold still%s", dots[spin & 3u]);
+        }
+        else if (in_run && (now - last_valid) > GRACE_MS)
+        {
+            in_run = 0u;                               /* finger really gone */
+            hist_reset(&hr_hist);
+        }
+
+        /* live screen: time left + what the sensor is saying right now */
+        snprintf(l1, sizeof(l1), "Dose due!    %2lus", (unsigned long)left);
+        if (st != HAL_OK)
+        {
+            strcpy(l2, "Sensor offline");
+        }
+        else if (ok && rd.spo2 > 0)
+        {
+            snprintf(l2, sizeof(l2), "HR %ld SpO2 %d%%", (long)rd.heartbeat, (int)rd.spo2);
+        }
+        else if (ok)
+        {
+            snprintf(l2, sizeof(l2), "HR %ld", (long)rd.heartbeat);
+        }
+        else if (in_run)
+        {
+            strcpy(l2, "Hold still...");
         }
         else
         {
-            snprintf(l2, sizeof(l2), "Place finger%s", dots[spin & 3u]);
+            strcpy(l2, "Place finger...");
         }
-
-        show2("Dose due!", l2);
-        spin++;
+        show2(l1, l2);
 
         {   /* wait POLL_MS in 10 ms slices so '#' and B3 respond quickly */
             uint16_t t;
