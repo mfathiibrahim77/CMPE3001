@@ -9,7 +9,9 @@
 //            B1 = change PIN (needs old PIN)
 //            B2 = carer override (needs PIN) - give or skip a dose
 //            B3 = restart from scratch (demo) - no PIN
-//  The PIN is the CARER's PIN: setup, override, refill, change PIN.
+//  Two PINs (must be different):
+//    CARER PIN   - override (B2), refill, change own PIN
+//    PATIENT PIN - unlock at start-up, change own PIN
 // ======================================================================
 
 // ==================================================================
@@ -46,15 +48,21 @@
 #define HR_MIN            50
 #define HR_MAX            120
 
-/* ---- Vitals filter ----
- * The module only produces a NEW result about every 4 s and keeps its last
- * number in between (even after the finger is removed). So we only count a
- * reading when it is fresh (different from the previous one), need HIST_N
- * fresh readings that agree, and need the finger on for MIN_MEASURE_MS. */
+/* ---- Vitals ----
+ * The sensor needs ~4-8 s to work out a pulse, then gives a new result about
+ * every 4 s and HOLDS the last one in between - even for a few seconds after
+ * the finger is lifted. We sample once a second and accept a reading once it
+ * is steady AND has stayed valid long enough:
+ *   QUICK_HOLD_MS   - normal reading that appeared after we started
+ *   CONFIRM_HOLD_MS - a number was already showing when we started (could be
+ *                     a leftover), or the value is abnormal (could be the
+ *                     pulse "doubling" glitch): wait past one sensor update. */
 #define POLL_MS           250u
-#define HIST_N            2           /* fresh readings that must agree     */
+#define SAMPLE_MS         1000u       /* read the sensor once a second      */
+#define HIST_N            2           /* samples that must agree            */
 #define HR_SPREAD_MAX     12          /* max spread across them (bpm)       */
-#define MIN_MEASURE_MS    4000u       /* finger on for at least 4 s         */
+#define QUICK_HOLD_MS     1000u
+#define CONFIRM_HOLD_MS   6000u
 #define VITALS_TIMEOUT_MS 20000u      /* give up after 20 s -> "No vitals"  */
 
 /* ---- PIN ---- */
@@ -81,8 +89,16 @@
 // SECTION 0  ->  paste UNDER its BEGIN marker line
 //                   and ABOVE its END marker line
 // ==================================================================
-/* ---- the live PIN, held in RAM (set fresh at every power-up) ---- */
-static char current_pin[PIN_LEN + 1] = "";
+/* ---- two PINs, held in RAM (set fresh at every power-up) ----
+ * CARER PIN  : carer override, refill, change own PIN
+ * PATIENT PIN: unlock the dispenser at start-up, change own PIN
+ * They must be different, so knowing one never gives the other's rights. */
+static char carer_pin[PIN_LEN + 1]   = "";
+static char patient_pin[PIN_LEN + 1] = "";
+
+#define ROLE_NONE         0u
+#define ROLE_PATIENT      1u
+#define ROLE_CARER        2u
 
 /* -------- small helpers -------- */
 
@@ -223,22 +239,33 @@ static void enter_pin(const char *prompt, char *out)
     }
 }
 
-/* Set a new PIN into dest, requiring the two entries to match.
- * When changing an existing PIN, the new one must be DIFFERENT from it. */
-static void set_new_pin(char *dest)
+/* Red LED + two-line warning for 1.5 s, then LED off. */
+static void pin_warn(const char *l1, const char *l2)
+{
+    Panel_SetLed(LED_ALERT, 1);
+    show2(l1, l2);
+    HAL_Delay(1500);
+    Panel_SetLed(LED_ALERT, 0);
+}
+
+/* Set a new PIN into dest (typed twice). It may not equal the old value
+ * of dest, nor the other person's PIN. */
+static void set_new_pin(char *dest, const char *other, const char *prompt)
 {
     char a[PIN_LEN + 1], b[PIN_LEN + 1];
 
     for (;;)
     {
-        enter_pin("Set new PIN:", a);
+        enter_pin(prompt, a);
 
-        if (dest[0] != '\0' && strncmp(a, dest, PIN_LEN) == 0)   /* same as old */
+        if (dest[0] != '\0' && strncmp(a, dest, PIN_LEN) == 0)
         {
-            Panel_SetLed(LED_ALERT, 1);
-            show2("Same as old PIN", "Choose another");
-            HAL_Delay(1800);
-            Panel_SetLed(LED_ALERT, 0);
+            pin_warn("Same as old PIN", "Choose another");
+            continue;
+        }
+        if (other[0] != '\0' && strncmp(a, other, PIN_LEN) == 0)
+        {
+            pin_warn("PIN already used", "Choose another");
             continue;
         }
 
@@ -253,37 +280,43 @@ static void set_new_pin(char *dest)
             Panel_SetLed(LED_OK, 0);
             return;
         }
-
-        Panel_SetLed(LED_ALERT, 1);
-        show2("PIN mismatch", "Try again");
-        HAL_Delay(1500);
-        Panel_SetLed(LED_ALERT, 0);
+        pin_warn("PIN mismatch", "Try again");
     }
 }
 
-/* Ask for the PIN and compare it to current_pin: 1 = match. */
-static uint8_t verify_pin(const char *prompt)
+/* Ask for a PIN and work out whose it is. */
+static uint8_t check_pin(const char *prompt)
 {
     char e[PIN_LEN + 1];
     enter_pin(prompt, e);
-    return (strncmp(e, current_pin, PIN_LEN) == 0) ? 1u : 0u;
+    if (strncmp(e, carer_pin,   PIN_LEN) == 0) { return ROLE_CARER;   }
+    if (strncmp(e, patient_pin, PIN_LEN) == 0) { return ROLE_PATIENT; }
+    return ROLE_NONE;
 }
 
-/* Short "wrong PIN" warning: red LED on, message, then off. */
-static void wrong_pin(const char *line2)
-{
-    Panel_SetLed(LED_ALERT, 1);
-    show2("Wrong PIN", line2);
-    HAL_Delay(1500);
-    Panel_SetLed(LED_ALERT, 0);
-}
-
-/* Keep asking for the PIN until it is right (log-in and refill). */
-static void require_pin(const char *prompt, const char *ok_msg)
+/* Unlock at start-up: the patient (or carer) PIN. */
+static void login(void)
 {
     for (;;)
     {
-        if (verify_pin(prompt))
+        if (check_pin("Enter PIN:") != ROLE_NONE)
+        {
+            Panel_SetLed(LED_OK, 1);
+            show2("Unlocked", "");
+            HAL_Delay(900);
+            Panel_SetLed(LED_OK, 0);
+            return;
+        }
+        pin_warn("Wrong PIN", "Try again");
+    }
+}
+
+/* Keep asking until the CARER PIN is entered (patient PIN not accepted). */
+static void require_carer(const char *prompt, const char *ok_msg)
+{
+    for (;;)
+    {
+        if (check_pin(prompt) == ROLE_CARER)
         {
             Panel_SetLed(LED_OK, 1);
             show2(ok_msg, "");
@@ -291,30 +324,27 @@ static void require_pin(const char *prompt, const char *ok_msg)
             Panel_SetLed(LED_OK, 0);
             return;
         }
-        wrong_pin("Try again");
+        pin_warn("Carer PIN only", "Try again");
     }
 }
 
-/* Change the PIN - old PIN must be entered first. */
+/* B1: change a PIN. The old PIN says whose PIN is being changed. */
 static void change_pin(void)
 {
-    if (verify_pin("Old PIN:"))
-    {
-        set_new_pin(current_pin);
-    }
-    else
-    {
-        wrong_pin("Not changed");
-    }
+    uint8_t who = check_pin("Old PIN:");
+
+    if      (who == ROLE_CARER)   { set_new_pin(carer_pin,   patient_pin, "New carer PIN:");   }
+    else if (who == ROLE_PATIENT) { set_new_pin(patient_pin, carer_pin,   "New patient PIN:"); }
+    else                          { pin_warn("Wrong PIN", "Not changed"); }
 }
 
-/* Carer override. The PIN is required so the patient cannot override it
- * themselves. Returns 1 = give the dose, 0 = skip it, -1 = wrong PIN. */
+/* Carer override. Only the CARER PIN is accepted, so the patient cannot
+ * override it themselves. Returns 1 = give, 0 = skip, -1 = not authorised. */
 static int8_t carer_decision(void)
 {
-    if (!verify_pin("Carer PIN:"))
+    if (check_pin("Carer PIN:") != ROLE_CARER)
     {
-        wrong_pin("Not authorised");
+        pin_warn("Not authorised", "Carer PIN only");
         return -1;
     }
 
@@ -329,8 +359,8 @@ static int8_t carer_decision(void)
     }
 }
 
-/* All compartments used: show the log, then only the PIN holder can
- * confirm the refill and restart the cycle. */
+/* All compartments used: show the log, then only the CARER can confirm
+ * the refill and restart the cycle. */
 static void refill_gate(uint32_t taken)
 {
     char l2[17];
@@ -340,7 +370,7 @@ static void refill_gate(uint32_t taken)
     show2("All doses done", l2);
     HAL_Delay(3000);
 
-    require_pin("Refill - PIN:", "Refilled");
+    require_carer("Carer PIN:", "Refilled");
 }
 
 /* ===== Heart-rate stability filter (idea from the §9 reference app) =====
@@ -378,51 +408,64 @@ static int32_t hist_stable(const Hist *h, int32_t spread_max)
 }
 
 /* One vitals measurement. Returns a settled HR (bpm), or -1 on timeout or
- * '#' skip. *spo2_out gets the matching SpO2 (or -1).
- * Only FRESH readings count: the module holds its last number between
- * updates and even with no finger, so a repeated number is ignored. */
+ * '#' skip. *spo2_out gets the matching SpO2 (or -1). See the Vitals notes
+ * in the defines for why the hold times differ. */
 static int32_t measure_vitals(int32_t *spo2_out)
 {
-    uint32_t   start = HAL_GetTick();
-    uint8_t    spin  = 0;
+    uint32_t   start       = HAL_GetTick();
+    uint32_t   last_sample = 0;
+    uint32_t   valid_since = 0;
+    uint8_t    valid       = 0;      /* sensor currently giving a reading   */
+    uint8_t    leftover    = 0;      /* a number was showing when we began  */
+    uint8_t    first       = 1;
+    uint8_t    spin        = 0;
     OxiReading rd;
     Hist       hr_hist;
-    int32_t    last_raw  = -1;
-    int32_t    last_spo2 = -1;
+    int32_t    last_spo2   = -1;
     static const char *dots[4] = { "   ", ".  ", ".. ", "..." };
 
     hist_reset(&hr_hist);
     *spo2_out = -1;
 
-    /* restart acquisition for a clean measurement */
-    Oxi_Stop();
-    HAL_Delay(50);
-    Oxi_Start(&hi2c3);
-
-    /* whatever is in the module now may be a leftover - remember it so it
-     * is never counted as a new reading */
-    if (Oxi_Read(&rd) == HAL_OK) { last_raw = rd.heartbeat; }
+    if (Oxi_Read(&rd) == HAL_OK && rd.heartbeat > 0) { leftover = 1u; }
 
     show2("Dose due!", "Place finger...");
 
     while ((HAL_GetTick() - start) < VITALS_TIMEOUT_MS)
     {
-        char l2[17];
+        uint32_t now = HAL_GetTick();
+        char     l2[17];
 
-        if (Oxi_Read(&rd) == HAL_OK && rd.heartbeat > 0 && rd.heartbeat != last_raw)
+        if (first || (now - last_sample) >= SAMPLE_MS)      /* once a second */
         {
-            last_raw = rd.heartbeat;                 /* a genuinely new reading */
-            hist_push(&hr_hist, rd.heartbeat);
-            if (rd.spo2 > 0) { last_spo2 = rd.spo2; }
+            first       = 0u;
+            last_sample = now;
+            if (Oxi_Read(&rd) == HAL_OK && rd.heartbeat > 0)
+            {
+                if (!valid) { valid = 1u; valid_since = now; }
+                hist_push(&hr_hist, rd.heartbeat);
+                if (rd.spo2 > 0) { last_spo2 = rd.spo2; }
+            }
+            else                                 /* no finger / no result yet */
+            {
+                valid    = 0u;
+                leftover = 0u;                   /* anything after this is new */
+                hist_reset(&hr_hist);
+            }
         }
 
-        if (hr_hist.cnt > 0u)
+        if (valid)
         {
             int32_t settled = hist_stable(&hr_hist, HR_SPREAD_MAX);
-            if (settled > 0 && (HAL_GetTick() - start) >= MIN_MEASURE_MS)
+            if (settled > 0)
             {
-                *spo2_out = last_spo2;
-                return settled;
+                uint8_t  normal = (uint8_t)(settled >= HR_MIN && settled <= HR_MAX);
+                uint32_t need   = (leftover || !normal) ? CONFIRM_HOLD_MS : QUICK_HOLD_MS;
+                if ((now - valid_since) >= need)
+                {
+                    *spo2_out = last_spo2;
+                    return settled;
+                }
             }
             snprintf(l2, sizeof(l2), "Hold still%s", dots[spin & 3u]);
         }
@@ -477,8 +520,9 @@ static int32_t measure_vitals(int32_t *spo2_out)
     servo_set(SERVO_HOME);
     HAL_Delay(700);
 
-    set_new_pin(current_pin);                   // carer sets the PIN (set + confirm)
-    require_pin("Enter PIN:", "Unlocked");      // log in with that PIN
+    set_new_pin(carer_pin,   patient_pin, "New carer PIN:");    // carer sets up first
+    set_new_pin(patient_pin, carer_pin,   "New patient PIN:");  // then the patient's PIN
+    login();                                                    // unlock with a PIN
 
     Oxi_Start(&hi2c3);                          // start heart-rate acquisition
     HAL_Delay(500);
