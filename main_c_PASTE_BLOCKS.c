@@ -39,8 +39,8 @@
 #define NUM_SLOTS         4u
 
 /* ---- Timing (seconds). Short values so the demo runs quickly. ---- */
-#define DOSE_INTERVAL_S   15u         /* gap between doses                  */
-#define CONFIRM_WINDOW_S  15u         /* time to press "taken" (B0)         */
+#define DOSE_INTERVAL_S   5u          /* gap between doses                  */
+#define CONFIRM_WINDOW_S  10u         /* time to press "taken" (B0)         */
 
 /* ---- Heart-rate safe band (bpm) ---- */
 #define HR_MIN            50
@@ -52,10 +52,10 @@
  * reading when it is fresh (different from the previous one), need HIST_N
  * fresh readings that agree, and need the finger on for MIN_MEASURE_MS. */
 #define POLL_MS           250u
-#define HIST_N            3           /* fresh readings that must agree     */
+#define HIST_N            2           /* fresh readings that must agree     */
 #define HR_SPREAD_MAX     12          /* max spread across them (bpm)       */
-#define MIN_MEASURE_MS    6000u       /* finger on for at least 6 s         */
-#define VITALS_TIMEOUT_MS 30000u      /* give up after 30 s -> "No vitals"  */
+#define MIN_MEASURE_MS    4000u       /* finger on for at least 4 s         */
+#define VITALS_TIMEOUT_MS 20000u      /* give up after 20 s -> "No vitals"  */
 
 /* ---- PIN ---- */
 #define PIN_LEN           4
@@ -127,6 +127,39 @@ static void poll_restart(void)
 static void servo_set(uint16_t ccr)
 {
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, ccr);
+}
+
+/* Servo PWM set-up done in code, so the servo works even if the CubeMX
+ * clock or TIM2 settings are off: PA0 = TIM2_CH1, PWM mode 1, and a
+ * 50 Hz frame with 20 us per count, worked out from the real timer clock.
+ * (At 80 MHz this gives exactly the Lab 3 values: PSC 1599, ARR 999.) */
+static void servo_init(void)
+{
+    TIM_OC_InitTypeDef oc = {0};
+    GPIO_InitTypeDef   g  = {0};
+    uint32_t timclk = HAL_RCC_GetPCLK1Freq();
+
+    if ((RCC->CFGR & RCC_CFGR_PPRE1_2) != 0u) { timclk *= 2u; }  /* APB1 divided -> timer clock x2 */
+
+    oc.OCMode     = TIM_OCMODE_PWM1;
+    oc.Pulse      = SERVO_HOME;
+    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+    oc.OCFastMode = TIM_OCFAST_DISABLE;
+    HAL_TIM_PWM_ConfigChannel(&htim2, &oc, TIM_CHANNEL_1);
+
+    __HAL_TIM_SET_PRESCALER(&htim2, (timclk / 50000u) - 1u);   /* 50 kHz tick = 20 us */
+    __HAL_TIM_SET_AUTORELOAD(&htim2, 999u);                     /* 1000 ticks = 20 ms  */
+    htim2.Instance->EGR = TIM_EGR_UG;                           /* load the new values */
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();                               /* PA0 -> TIM2_CH1     */
+    g.Pin       = GPIO_PIN_0;
+    g.Mode      = GPIO_MODE_AF_PP;
+    g.Pull      = GPIO_NOPULL;
+    g.Speed     = GPIO_SPEED_FREQ_LOW;
+    g.Alternate = GPIO_AF1_TIM2;
+    HAL_GPIO_Init(GPIOA, &g);
+
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
 }
 
 static uint16_t slot_ccr(uint8_t slot)
@@ -432,7 +465,7 @@ static int32_t measure_vitals(int32_t *spo2_out)
     Panel_SetLed(LED_OK, 0);
     Panel_SetLed(LED_ALERT, 0);
 
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);   // servo PWM on PA0
+    servo_init();                               // servo PWM on PA0 (TIM2_CH1, 50 Hz)
 
     /* Servo self-test: visit all 4 compartments, then rest at 90 deg.
      * If the servo does not move HERE, check TIM2 / clock / wiring. */
@@ -449,7 +482,7 @@ static int32_t measure_vitals(int32_t *spo2_out)
 
     Oxi_Start(&hi2c3);                          // start heart-rate acquisition
     HAL_Delay(500);
-    show2("Dispenser ready", "Next dose: 15s");
+    show2("Dispenser ready", "Next dose soon");
 
     /* ---- loop variables ---- */
     typedef enum { ST_WAIT, ST_MEASURE, ST_CHECK, ST_HELD, ST_GIVE,
@@ -469,6 +502,9 @@ static int32_t measure_vitals(int32_t *spo2_out)
 // SECTION 3  ->  paste UNDER its BEGIN marker line
 //                   and ABOVE its END marker line
 // ==================================================================
+// !! WARNING: CubeMX puts the  }  that closes while(1) INSIDE this
+// !! section, just above the END 3 marker. KEEP IT. After pasting,
+// !! the bottom must read:   HAL_Delay(50);  then  }  then END 3.
     poll_restart();                              // B3 works on every screen
 
     switch (state)
@@ -480,7 +516,7 @@ static int32_t measure_vitals(int32_t *spo2_out)
             change_pin();
             while (btn_down(CHANGE_PORT, CHANGE_PIN)) { HAL_Delay(10); }
             last_tick = HAL_GetTick();
-            show2("Dispenser ready", "Next dose: 15s");
+            show2("Dispenser ready", "Next dose soon");
             break;
         }
         if (btn_down(OVERRIDE_PORT, OVERRIDE_PIN))   // carer: give/skip now
@@ -599,7 +635,7 @@ static int32_t measure_vitals(int32_t *spo2_out)
         }
         else
         {
-            show2("Dispenser ready", "Next dose: 15s");
+            show2("Dispenser ready", "Next dose soon");
             state = ST_WAIT;
         }
         break;
@@ -611,7 +647,7 @@ static int32_t measure_vitals(int32_t *spo2_out)
         slot        = 0;
         remaining   = DOSE_INTERVAL_S;
         last_tick   = HAL_GetTick();
-        show2("Dispenser ready", "Next dose: 15s");
+        show2("Dispenser ready", "Next dose soon");
         state       = ST_WAIT;
         break;
     }
